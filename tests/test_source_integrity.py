@@ -116,3 +116,24 @@ def test_no_file_forbids_its_own_redistribution():
         "these files forbid redistribution and cannot ship in a public tree: "
         f"{offenders}"
     )
+
+
+def test_cuda_family_target_promotion_is_probed_not_hardcoded():
+    """sm_90a and the Blackwell 'a' targets unlock the matrix-core
+    instructions; without the suffix nvcc builds the portable subset and the
+    tensor pipes never reach their real issue rate.
+
+    Which suffixes exist depends on the toolkit as well as the architecture,
+    so the target is probed. The runner has to probe the same way, because its
+    answer is part of the build cache key: a mismatch serves a binary compiled
+    for the portable target to a build that now asks for the other one.
+    """
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+    assert "ARCH_SUFFIX" in makefile
+    assert "--gpu-architecture=sm_$(DETECTED_ARCH)a" in makefile
+    # A trailing space on the fallback would make the concatenation "86 a".
+    assert "DETECTED_ARCH := 86\n" in makefile
+
+    runner = Path("pantheon.py").read_text(encoding="utf-8")
+    assert "def cuda_arch_suffix(" in runner
+    assert "cuda_arch_suffix(detected_arch)" in runner
