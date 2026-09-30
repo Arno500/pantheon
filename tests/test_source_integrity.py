@@ -215,6 +215,23 @@ def test_sfu_furnaces_issue_to_the_special_function_unit():
         assert "PANTHEON_CHAOS_SFU_STEP" in src, f"{name} lost the shared SFU step"
 
 
+def test_matrix_furnaces_restage_their_operands():
+    """Fragments filled with one constant let the multiplier array recompute
+    identical partial products forever, and drive the accumulator to a
+    magnitude where the FP32 increment vanishes into rounding.
+    """
+    for name in ("kernels/mma_virus/mma_virus.cpp",):
+        src = Path(name).read_text(encoding="utf-8")
+        assert "pantheon_operand_hash" in src, f"{name} must restage operands"
+        assert "wmma::load_matrix_sync" in src
+        # Several accumulators, because mma_sync into one serialises on its
+        # own result exactly as a single FMA chain does. Written either as
+        # named fragments or as an array cleared in a loop.
+        named = src.count("wmma::fill_fragment(c")
+        array = "wmma::fill_fragment(c[k]" in src
+        assert named >= 4 or array, f"{name} lost its accumulators"
+
+
 def test_shared_chaos_header_triggers_rebuilds():
     """toggle_chaos.h now carries the arithmetic of nine workloads, so it has
     to be in the dependency list. Without it, editing the header leaves every
