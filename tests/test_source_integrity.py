@@ -137,3 +137,91 @@ def test_cuda_family_target_promotion_is_probed_not_hardcoded():
     runner = Path("pantheon.py").read_text(encoding="utf-8")
     assert "def cuda_arch_suffix(" in runner
     assert "cuda_arch_suffix(detected_arch)" in runner
+
+
+# The arithmetic furnaces, and what each one's recurrence measured before it
+# was fixed. A datapath that stops toggling stops drawing power, and a golden
+# pass computed in that state compares a constant against the same constant,
+# so --verify cannot fail. Both were measured over each kernel's real default
+# loop count; the numbers are in kernels/common/toggle_chaos.h.
+ARITHMETIC_FURNACES = (
+    "kernels/compute_virus/compute_virus.cpp",
+    "kernels/compute_virus/compute_virus_agg.cpp",
+    "kernels/fp64_virus/fp64_virus.cpp",
+    "kernels/pulse_virus/pulse_virus.cpp",
+    "kernels/tensor_virus/tensor_virus.cpp",
+    "kernels/sfu_stress/sfu_stress.cpp",
+    "kernels/memory_thermal_asym/memory_thermal_asym.cpp",
+    "kernels/memory_retention_bake/memory_retention_bake.cpp",
+)
+
+
+def test_arithmetic_furnaces_use_the_shared_bounded_state():
+    """Every furnace has to draw its state from toggle_chaos.h.
+
+    Each one previously carried its own recurrence, and eight of the nine
+    either saturated to infinity within the first ten FMAs or converged onto a
+    fixed point within a few dozen steps. Sharing one documented, provably
+    closed map is what stops the next copy from drifting back.
+    """
+    for name in ARITHMETIC_FURNACES:
+        src = Path(name).read_text(encoding="utf-8")
+        assert "toggle_chaos.h" in src, f"{name} must use the shared bounded state"
+
+
+def test_no_furnace_reintroduces_the_saturating_chain():
+    """Guard the specific shape that overflowed.
+
+    a=fma(a,b,c); b=fma(b,c,a); c=fma(c,a,b) seeded near 1.0 reaches infinity
+    after eight FP32 FMAs and seven in FP16. It reads as a perfectly
+    reasonable ALU stress loop, which is why it was copied into six kernels.
+    """
+    coupled = re.compile(
+        r"(?:__builtin_)?(?:fmaf?|__hfma2)\s*\(\s*a\s*,\s*b\s*,\s*c\s*\)"
+        r"|(?:__builtin_)?(?:fmaf?|__hfma2)\s*\(\s*b\s*,\s*c\s*,\s*[ad]\s*\)"
+    )
+    offenders = []
+    for name in ARITHMETIC_FURNACES:
+        for line in Path(name).read_text(encoding="utf-8").splitlines():
+            # A mock-build "#define __hfma2(a, b, c)" is a macro signature,
+            # not the recurrence.
+            if line.lstrip().startswith("#define"):
+                continue
+            if coupled.search(line):
+                offenders.append(f"{name}: {line.strip()}")
+    assert offenders == [], f"saturating coupled chain is back in: {offenders}"
+
+
+def test_sfu_furnaces_issue_to_the_special_function_unit():
+    """sinf/cosf are multi-instruction library routines that spend most of
+    their cycles in the FMA pipe. A test built on them measures the wrong
+    unit, so the SFU paths use the fast intrinsics.
+    """
+    header = Path("kernels/common/toggle_chaos.h").read_text(encoding="utf-8")
+    for fast in ("__sinf(", "__cosf(", "__expf(", "__logf(", "rsqrtf("):
+        assert fast in header, f"toggle_chaos.h lost {fast}"
+
+    # The library spellings must not come back in the SFU workloads. The
+    # lookbehind keeps __sinf from counting as a hit on sinf.
+    library = re.compile(r"(?<![_a-zA-Z])(?:sinf|cosf|expf|logf)\s*\(")
+    for name in ("kernels/sfu_stress/sfu_stress.cpp",
+                 "kernels/common/toggle_chaos.h"):
+        src = Path(name).read_text(encoding="utf-8")
+        assert not library.search(src), f"{name} uses the library transcendentals again"
+
+    # And the chains themselves have to come from the shared step.
+    for name in ("kernels/sfu_stress/sfu_stress.cpp",):
+        src = Path(name).read_text(encoding="utf-8")
+        assert "PANTHEON_CHAOS_SFU_STEP" in src, f"{name} lost the shared SFU step"
+
+
+def test_shared_chaos_header_triggers_rebuilds():
+    """toggle_chaos.h now carries the arithmetic of nine workloads, so it has
+    to be in the dependency list. Without it, editing the header leaves every
+    binary stale and the next run silently measures the old math.
+    """
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+    common = [line for line in makefile.splitlines()
+              if line.startswith("COMMON_HEADERS")]
+    assert common, "COMMON_HEADERS disappeared"
+    assert "kernels/common/toggle_chaos.h" in common[0]

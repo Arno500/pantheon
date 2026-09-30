@@ -911,7 +911,7 @@ TEST_REGISTRY = {
     "sfu_stress":     {"bin": "sfu_stress",      "args": [], "desc": "SFU Virus (Transcendental Math)"},
     "pcie_bandwidth": {"bin": "pcie_bandwidth",  "args": [], "desc": "PCIe Thrasher (Host <-> Device)"},
     "pulse_virus":    {"bin": "pulse_virus",     "args": [], "desc": "Transient Pulse (VRM Attack 10Hz)"},
-    "tensor_virus":   {"bin": "tensor_virus",    "args": [], "desc": "Tensor Virus (FP16 Matrix Power)"},
+    "tensor_virus":   {"bin": "tensor_virus",    "args": [], "desc": "Tensor Virus (Packed FP16 Vector Pipe)"},
     "atomic_virus":   {"bin": "atomic_virus",    "args": [], "desc": "Atomic Virus (L2 Cache Thrash)"},
     "omni_virus":      {"bin": "omni_virus",       "args": [], "desc": "Omni Virus (Mem + FP16 + FP32 Async)"},
 
