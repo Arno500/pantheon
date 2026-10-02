@@ -913,7 +913,7 @@ TEST_REGISTRY = {
     "pulse_virus":    {"bin": "pulse_virus",     "args": [], "desc": "Transient Pulse (VRM Attack 10Hz)"},
     "tensor_virus":   {"bin": "tensor_virus",    "args": [], "desc": "Tensor Virus (Packed FP16 Vector Pipe)"},
     "atomic_virus":   {"bin": "atomic_virus",    "args": [], "desc": "Atomic Virus (L2 Cache Thrash)"},
-    "omni_virus":      {"bin": "omni_virus",       "args": [], "desc": "Omni Virus (Mem + FP16 + FP32 Async)"},
+    "omni_virus":      {"bin": "omni_virus",       "args": [], "desc": "Omni Virus (Tensor + Mem + FP16/FP32 + SFU Async)"},
 
     # --- NEW: Specialized Hardware Blocks ---
     "p2p_thrasher":     {"bin": "p2p_thrasher",     "args": [], "desc": "P2P Thrasher (Multi-GPU Interconnect)"},

@@ -153,6 +153,7 @@ ARITHMETIC_FURNACES = (
     "kernels/sfu_stress/sfu_stress.cpp",
     "kernels/memory_thermal_asym/memory_thermal_asym.cpp",
     "kernels/memory_retention_bake/memory_retention_bake.cpp",
+    "kernels/omni_virus/omni_virus.cpp",
 )
 
 
@@ -205,12 +206,14 @@ def test_sfu_furnaces_issue_to_the_special_function_unit():
     # lookbehind keeps __sinf from counting as a hit on sinf.
     library = re.compile(r"(?<![_a-zA-Z])(?:sinf|cosf|expf|logf)\s*\(")
     for name in ("kernels/sfu_stress/sfu_stress.cpp",
-                 "kernels/common/toggle_chaos.h"):
+                 "kernels/common/toggle_chaos.h",
+                 "kernels/omni_virus/omni_virus.cpp"):
         src = Path(name).read_text(encoding="utf-8")
         assert not library.search(src), f"{name} uses the library transcendentals again"
 
     # And the chains themselves have to come from the shared step.
-    for name in ("kernels/sfu_stress/sfu_stress.cpp",):
+    for name in ("kernels/sfu_stress/sfu_stress.cpp",
+                 "kernels/omni_virus/omni_virus.cpp"):
         src = Path(name).read_text(encoding="utf-8")
         assert "PANTHEON_CHAOS_SFU_STEP" in src, f"{name} lost the shared SFU step"
 
@@ -220,7 +223,8 @@ def test_matrix_furnaces_restage_their_operands():
     identical partial products forever, and drive the accumulator to a
     magnitude where the FP32 increment vanishes into rounding.
     """
-    for name in ("kernels/mma_virus/mma_virus.cpp",):
+    for name in ("kernels/mma_virus/mma_virus.cpp",
+                 "kernels/omni_virus/omni_virus.cpp"):
         src = Path(name).read_text(encoding="utf-8")
         assert "pantheon_operand_hash" in src, f"{name} must restage operands"
         assert "wmma::load_matrix_sync" in src
