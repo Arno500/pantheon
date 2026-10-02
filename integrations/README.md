@@ -10,6 +10,9 @@ the `pantheon-gpu` package. They work with Pantheon 1.2.2 and later.
 | Slurm | Test the cards of a job when it ends; accept a node before it goes into service | [`slurm/`](slurm/) |
 | NHC | The health check that Slurm or PBS runs on a node | [`nhc/`](nhc/) |
 | ReFrame | A regression test with one performance value for each card | [`reframe/`](reframe/) |
+| Prometheus | The verdict and the numbers as metrics, for node_exporter and Grafana | [`prometheus/`](prometheus/) |
+| Kubernetes | A Job for one node and a Helm chart for many | [`kubernetes/`](kubernetes/) |
+| Apptainer | A definition file for sites that run containers through Apptainer | [`apptainer/`](apptainer/) |
 
 Elsewhere:
 
@@ -85,7 +88,8 @@ are named by UUID, and MIG devices, are not guessed: the check stops and asks
 for `--gpu`.
 
 `--report-dir DIR` keeps the reports and the log of each workload. `--json`
-prints the result for a program to read.
+prints the result for a program to read, and `--textfile PATH` writes it as
+Prometheus metrics, see [`prometheus/`](prometheus/).
 
 ### How much load
 
@@ -114,6 +118,11 @@ Average power during the run, as the median over the cards in our
   injected fault, which drained the node both ways.
 - The ReFrame test ran with ReFrame 4.10.4 on an RTX 3060 and on the CPU
   backend, and failed as it should on an injected fault.
+- The Prometheus output has unit tests. The Helm chart passes `helm lint`
+  and its rendered manifests validate against the Kubernetes API schema; it
+  has not run on a cluster with GPUs. The Apptainer image was built from the
+  definition and ran a workload on the CPU backend; it has not run with
+  `--nv` on a GPU node.
 
 Not tested: a cluster with real GPUs under Slurm, AMD cards, and MIG devices.
 If you run one of these files there, we would like to hear how it went in the
