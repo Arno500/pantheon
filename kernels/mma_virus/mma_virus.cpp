@@ -1,6 +1,7 @@
 #include "../common/common.h"
 #include "../common/fp16_shim.h"
 #include "../common/toggle_chaos.h"
+#include "../common/vendor_gemm.h"
 #include <chrono>
 #include <string>
 #include <iostream>
@@ -188,11 +189,13 @@ int main(int argc, char* argv[]) {
     int mma_acc = 16;          // Accumulators per warp; 16 measured best on B200
     int mma_groups = 4;        // Operand reloads per iteration
     int mma_reuse = 1;         // MMA passes per operand reload
+    PantheonGemmOptions gemm_opt;   // vendor GEMM instead of WMMA, see vendor_gemm.h
 
     bool verify_mode = false;
     int inject_error = 0;
 
     for (int i = 1; i < argc; i++) {
+        if (gemm_opt.parse(argc, argv, &i)) continue;
         if (std::string(argv[i]) == "--verify") verify_mode = true;
         if (std::string(argv[i]) == "--inject_error") inject_error = 1;
         if (std::string(argv[i]) == "--block_size" && i+1 < argc) block_size = atoi(argv[++i]);
@@ -256,6 +259,21 @@ int main(int argc, char* argv[]) {
     hipDeviceProp_t prop; 
     CHECK(hipGetDeviceProperties(&prop, gpu_id));
 
+    // The vendor GEMM replaces the WMMA kernel when the library loads: it
+    // reaches the part's asynchronous matrix instructions, which mma_sync
+    // cannot. Verification compares each output with the first one.
+    bool use_gemm = false;
+    int gemm_batch = 0;
+    void* d_golden_gemm = nullptr;
+#if PANTHEON_VENDOR_GEMM
+    PantheonGemm gemm;
+    {
+        int status = pantheon_gemm_setup(gemm, gemm_opt, gpu_id);
+        if (status < 0) return 1;
+        use_gemm = (status == 1);
+    }
+#endif
+
     // --- 2. EXPLICIT OCCUPANCY ---
     int num_blocks = grid_size;
     bool auto_grid = false;
@@ -285,6 +303,14 @@ int main(int argc, char* argv[]) {
     std::cout << "  -> MMA Accums:    " << mma_acc << " per warp" << std::endl;
     std::cout << "  -> MMA Staging:   " << mma_groups << " reloads x " << mma_reuse
               << " passes" << std::endl;
+    if (use_gemm) {
+#if PANTHEON_VENDOR_GEMM
+        std::cout << "  -> Tensor Engine: vendor GEMM (" << PantheonGemm::type_name(gemm.type) << " "
+                  << gemm.m << "x" << gemm.n << "x" << gemm.k << ", FP32 accumulate)" << std::endl;
+#endif
+    } else {
+        std::cout << "  -> Tensor Engine: portable WMMA" << std::endl;
+    }
     std::cout << "  -> Verify Mode:   " << (verify_mode ? "ON" : "OFF") << std::endl;
     if (inject_error) std::cout << "[PANTHEON] Warning: SDC Fault Injection is ACTIVE!" << std::endl;
 
@@ -294,18 +320,37 @@ int main(int argc, char* argv[]) {
     if (verify_mode) {
         std::cout << "[PANTHEON] Generating expected Tensor Core baseline (Golden Pass)..." << std::endl;
         CHECK(hipMalloc(&d_golden_sink, total_threads * sizeof(float)));
-        MMA_LAUNCH_GOLDEN(num_blocks, block_size, kernel_loops, d_golden_sink, init_pattern);
-        CHECK(hipDeviceSynchronize());
+#if PANTHEON_VENDOR_GEMM
+        if (use_gemm) {
+            // One matmul is the reference: beta is 0, so every later run
+            // must reproduce these bits exactly.
+            CHECK(hipMalloc(&d_golden_gemm, gemm.out_size_bytes()));
+            if (!gemm.run(0)) { std::cerr << "[PANTHEON] Vendor GEMM matmul failed." << std::endl; return 1; }
+            CHECK(hipDeviceSynchronize());
+            CHECK(hipMemcpy(d_golden_gemm, gemm.c, gemm.out_size_bytes(), hipMemcpyDeviceToDevice));
+        } else
+#endif
+        {
+            MMA_LAUNCH_GOLDEN(num_blocks, block_size, kernel_loops, d_golden_sink, init_pattern);
+            CHECK(hipDeviceSynchronize());
+        }
     }
 
     // --- 4. WARMUP PHASE ---
     if (warmup_iters > 0) {
         std::cout << "[PANTHEON] Running " << warmup_iters << " warmup iterations..." << std::endl;
         for(int i = 0; i < warmup_iters; i++) {
+#if PANTHEON_VENDOR_GEMM
+            if (use_gemm) { gemm.run(0); continue; }
+#endif
             MMA_LAUNCH_STRESS(num_blocks, block_size, kernel_loops, d_sink, inject_error, init_pattern);
         }
         CHECK(hipDeviceSynchronize());
     }
+
+#if PANTHEON_VENDOR_GEMM
+    if (use_gemm) gemm_batch = pantheon_gemm_batch(gemm, 0, 200);
+#endif
 
     std::cout << "[PANTHEON] Starting active telemetry phase..." << std::endl;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -316,10 +361,20 @@ int main(int argc, char* argv[]) {
 
     // --- 5. ACTIVE LOOP ---
     while(true) {
-        MMA_LAUNCH_STRESS(num_blocks, block_size, kernel_loops, d_sink, inject_error, init_pattern);
-        CHECK(hipDeviceSynchronize());
-        
-        ops_performed += (size_t)num_blocks * warps_per_block * kernel_loops * (size_t)mma_groups * (size_t)mma_reuse * (size_t)mma_acc * flops_per_wmma;
+#if PANTHEON_VENDOR_GEMM
+        if (use_gemm) {
+            for (int r = 0; r < gemm_batch; ++r) {
+                if (!gemm.run(0)) { std::cerr << "[PANTHEON] Vendor GEMM matmul failed." << std::endl; return 1; }
+            }
+            CHECK(hipDeviceSynchronize());
+            ops_performed += (size_t)(gemm.flops_per_run() * (double)gemm_batch);
+        } else
+#endif
+        {
+            MMA_LAUNCH_STRESS(num_blocks, block_size, kernel_loops, d_sink, inject_error, init_pattern);
+            CHECK(hipDeviceSynchronize());
+            ops_performed += (size_t)num_blocks * warps_per_block * kernel_loops * (size_t)mma_groups * (size_t)mma_reuse * (size_t)mma_acc * flops_per_wmma;
+        }
         
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() >= duration) break;
@@ -337,7 +392,19 @@ int main(int argc, char* argv[]) {
         CHECK(hipMemset(d_err_count, 0, sizeof(unsigned int)));
         
         int verify_blocks = (total_threads + 255) / 256;
-        LAUNCH_KERNEL(verify_mma_kernel, verify_blocks, 256, d_sink, d_golden_sink, total_threads, d_err_count);
+        float* verify_actual = d_sink;
+        float* verify_expected = d_golden_sink;
+        size_t verify_count = total_threads;
+#if PANTHEON_VENDOR_GEMM
+        if (use_gemm) {
+            if (inject_error) LAUNCH_KERNEL(pantheon_gemm_flip_bit, 1, 1, (unsigned int*)gemm.c);
+            verify_actual = (float*)gemm.c;
+            verify_expected = (float*)d_golden_gemm;
+            verify_count = gemm.out_words();
+            verify_blocks = (int)((verify_count + 255) / 256);
+        }
+#endif
+        LAUNCH_KERNEL(verify_mma_kernel, verify_blocks, 256, verify_actual, verify_expected, verify_count, d_err_count);
         CHECK(hipDeviceSynchronize());
         
         unsigned int h_err_count = 0;
@@ -345,6 +412,7 @@ int main(int argc, char* argv[]) {
         
         CHECK(hipFree(d_err_count));
         CHECK(hipFree(d_golden_sink));
+        if (d_golden_gemm) CHECK(hipFree(d_golden_gemm));
 
         // Say so on success too. Silence is indistinguishable from a
         // verification that never ran, which is how a self-test that
@@ -357,6 +425,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+#if PANTHEON_VENDOR_GEMM
+    gemm.release();
+#endif
     CHECK(hipFree(d_sink));
     return 0;
 #endif

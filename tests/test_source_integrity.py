@@ -279,6 +279,25 @@ def test_omni_virus_can_drive_the_tensor_cores_through_the_vendor_gemm():
     assert "pantheon_gemm_pick" in header
 
 
+def test_matrix_tests_share_one_vendor_gemm_with_both_backends():
+    """omni_virus and mma_virus bring the GEMM up through the same code, and
+    the header carries both vendor backends behind one set of aliases."""
+    header = Path("kernels/common/vendor_gemm.h").read_text(encoding="utf-8")
+    assert "hipblaslt/hipblaslt.h" in header
+    assert "cublasLt.h" in header
+    assert "libhipblaslt.so" in header
+    assert "dlopen" in header
+
+    for name in ("kernels/omni_virus/omni_virus.cpp",
+                 "kernels/mma_virus/mma_virus.cpp"):
+        src = Path(name).read_text(encoding="utf-8")
+        assert "pantheon_gemm_setup" in src, f"{name} must use the shared setup"
+        assert "gemm_opt.parse" in src, f"{name} lost the GEMM flags"
+        # Both tests fall back to WMMA rather than failing when the BLAS is
+        # absent, and say why.
+        assert "portable WMMA" in src or "using the portable WMMA" in header
+
+
 def test_gemm_auto_format_keeps_the_default_unless_clearly_beaten():
     """Probe noise on one part was larger than the gaps between formats, and
     taking the maximum picked different formats on GPUs of the same node. The
