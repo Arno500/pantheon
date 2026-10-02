@@ -1,6 +1,7 @@
 #include "../common/common.h"
 #include "../common/fp16_shim.h"
 #include "../common/toggle_chaos.h"
+#include "../common/vendor_gemm.h"
 #include <chrono>
 #include <string>
 #include <iostream>
@@ -347,6 +348,7 @@ __global__ void verify_compute_stream(int stream_id, float* sink, float* golden,
             if (stream_id == 1) printf("[SDC FAULT][OMNI_VIRUS] FP16 Stream Error! TID: %llu | Exp: 0x%08x | Act: 0x%08x | XOR: 0x%08x\n", (unsigned long long)tid, exp, act, xor_bits);
             else if (stream_id == 2) printf("[SDC FAULT][OMNI_VIRUS] FP32 Stream Error! TID: %llu | Exp: 0x%08x | Act: 0x%08x | XOR: 0x%08x\n", (unsigned long long)tid, exp, act, xor_bits);
             else if (stream_id == 3) printf("[SDC FAULT][OMNI_VIRUS] SFU Stream Error! TID: %llu | Exp: 0x%08x | Act: 0x%08x | XOR: 0x%08x\n", (unsigned long long)tid, exp, act, xor_bits);
+            else if (stream_id == 5) printf("[SDC FAULT][OMNI_VIRUS] GEMM Stream Error! Word: %llu | Exp: 0x%08x | Act: 0x%08x | XOR: 0x%08x\n", (unsigned long long)tid, exp, act, xor_bits);
             else if (stream_id == 4) printf("[SDC FAULT][OMNI_VIRUS] Tensor Stream Error! TID: %llu | Exp: 0x%08x | Act: 0x%08x | XOR: 0x%08x\n", (unsigned long long)tid, exp, act, xor_bits);
             atomicAdd(err_count, 1);
         }
@@ -406,6 +408,8 @@ int main(int argc, char* argv[]) {
     int mma_groups = 4;        // Operand reloads per iteration
     int mma_reuse = 1;         // MMA passes per operand reload
     int launch_ms = 200;       // Per-launch target; 0 = use kernel_loops
+    PantheonGemmOptions gemm_opt;   // vendor GEMM tensor stream, see vendor_gemm.h
+
     bool verify_mode = false;
     int inject_error = 0;
 
@@ -422,6 +426,7 @@ int main(int argc, char* argv[]) {
         if (std::string(argv[i]) == "--mma_groups" && i+1 < argc) mma_groups = atoi(argv[++i]);
         if (std::string(argv[i]) == "--mma_reuse" && i+1 < argc) mma_reuse = atoi(argv[++i]);
         if (std::string(argv[i]) == "--launch_ms" && i+1 < argc) launch_ms = atoi(argv[++i]);
+        if (gemm_opt.parse(argc, argv, &i)) continue;
         if (std::string(argv[i]) == "--init_pattern" && i+1 < argc) {
             if (!pantheon_parse_init_pattern(argv[++i], &init_pattern)) {
                 std::cerr << "[PANTHEON] Unknown --init_pattern '" << argv[i] << "'." << std::endl;
@@ -497,6 +502,25 @@ int main(int argc, char* argv[]) {
         block_size = rounded;
     }
 
+    // The vendor GEMM takes its operands first, so the memory stream's share
+    // is computed from what is left instead of colliding with them.
+    bool use_gemm = false;
+    int gemm_loops = 0;
+    void* d_gold_gemm = nullptr;
+#if PANTHEON_VENDOR_GEMM
+    PantheonGemm gemm;
+    if (mma_pct > 0) {
+        int status = pantheon_gemm_setup(gemm, gemm_opt, gpu_id);
+        if (status < 0) return 1;
+        use_gemm = (status == 1);
+    }
+#else
+    if (gemm_opt.enabled && mma_pct > 0) {
+        std::cout << "[PANTHEON] Vendor GEMM not built for this platform; "
+                  << "using the portable WMMA tensor stream." << std::endl;
+    }
+#endif
+
     size_t free, total; CHECK(hipMemGetInfo(&free, &total));
     if (mem_pct > 99) mem_pct = 99;
     size_t alloc_size = (free * mem_pct) / 100;
@@ -571,6 +595,12 @@ int main(int argc, char* argv[]) {
         if (blocks_fp32 < 1) blocks_fp32 = 1;
     }
 
+    // The vendor GEMM fills the machine by itself and cannot be confined to a
+    // block count, so it replaces the WMMA stream instead of sharing the
+    // tensor share with it. mma_pct then only decides how much of the grid
+    // the four companion streams get to fill around it.
+    if (use_gemm) blocks_mma = 0;
+
     // Words each memory-stream thread writes per loop. Bounded so that one
     // loop cannot exceed the buffer, which keeps the wrap in the kernel to a
     // single conditional subtract.
@@ -602,6 +632,14 @@ int main(int argc, char* argv[]) {
     std::cout << "  -> Grid Split:    tensor " << blocks_mma << " | mem " << blocks_mem
               << " | fp16 " << blocks_fp16 << " | fp32 " << blocks_fp32
               << " | sfu " << blocks_sfu << std::endl;
+    if (use_gemm) {
+#if PANTHEON_VENDOR_GEMM
+        std::cout << "  -> Tensor Engine: vendor GEMM (" << PantheonGemm::type_name(gemm.type) << " "
+                  << gemm.m << "x" << gemm.n << "x" << gemm.k << ", FP32 accumulate)" << std::endl;
+#endif
+    } else {
+        std::cout << "  -> Tensor Engine: portable WMMA" << std::endl;
+    }
     std::cout << "  -> MMA Share:     " << mma_pct << "%"
               << (pure_tensor ? " (pure tensor)" : "") << std::endl;
     std::cout << "  -> MMA Accums:    " << mma_acc << " per warp" << std::endl;
@@ -642,6 +680,12 @@ int main(int argc, char* argv[]) {
             LAUNCH_KERNEL_ASYNC(compute_sfu, blocks_sfu, block_size, 0, stream_sfu,
                                 n, d_sink_sfu, 0);
         });
+#if PANTHEON_VENDOR_GEMM
+        if (use_gemm) {
+            gemm_loops = pantheon_gemm_batch(gemm, stream_mma, launch_ms);
+            std::cout << "  -> gemm   loops: " << gemm_loops << std::endl;
+        }
+#endif
 #if OMNI_WMMA
         if (blocks_mma > 0) {
             mma_loops = omni_calibrate("tensor", target_s, 16, [&](int n) {
@@ -659,6 +703,7 @@ int main(int argc, char* argv[]) {
         sfu_loops  = (kernel_loops / 4 > 0) ? kernel_loops / 4 : 1;
         mem_loops  = (kernel_loops / 1000 > 0) ? kernel_loops / 1000 : 1;
         mma_loops  = (kernel_loops / 16 > 0) ? kernel_loops / 16 : 1;
+        gemm_loops = (kernel_loops / 500 > 0) ? kernel_loops / 500 : 1;
         std::cout << "  -> Kernel Loops:  " << kernel_loops
                   << " (calibration off; mem " << mem_loops << ", sfu " << sfu_loops
                   << ", tensor " << mma_loops << ")" << std::endl;
@@ -683,6 +728,16 @@ int main(int argc, char* argv[]) {
         LAUNCH_KERNEL_ASYNC(compute_fp16, blocks_fp16, block_size, 0, stream_fp16, fp16_loops, d_gold_fp16, 0);
         LAUNCH_KERNEL_ASYNC(compute_fp32, blocks_fp32, block_size, 0, stream_fp32, fp32_loops, d_gold_fp32, 0);
         LAUNCH_KERNEL_ASYNC(compute_sfu,  blocks_sfu,  block_size, 0, stream_sfu,  sfu_loops,  d_gold_sfu,  0);
+#if PANTHEON_VENDOR_GEMM
+        if (use_gemm) {
+            // One matmul is the whole reference: beta is 0, so every later
+            // run must reproduce these bits exactly.
+            CHECK(hipMalloc(&d_gold_gemm, gemm.out_size_bytes()));
+            if (!gemm.run(stream_mma)) { std::cerr << "[PANTHEON] Vendor GEMM matmul failed." << std::endl; return 1; }
+            CHECK(hipStreamSynchronize(stream_mma));
+            CHECK(hipMemcpy(d_gold_gemm, gemm.c, gemm.out_size_bytes(), hipMemcpyDeviceToDevice));
+        }
+#endif
 #if OMNI_WMMA
         if (blocks_mma > 0) {
             CHECK(hipMalloc(&d_gold_mma, mma_threads * sizeof(float)));
@@ -705,6 +760,9 @@ int main(int argc, char* argv[]) {
     mma_ops_per_launch = (mma_threads / (size_t)prop.warpSize) * (size_t)mma_loops
                        * (size_t)mma_groups * (size_t)mma_reuse * (size_t)mma_acc * 8192;
 #endif
+#if PANTHEON_VENDOR_GEMM
+    if (use_gemm) mma_ops_per_launch += (size_t)(gemm.flops_per_run() * (double)gemm_loops);
+#endif
     size_t total_ops_per_launch = mma_ops_per_launch + fp16_ops_per_launch
                                 + fp32_ops_per_launch + sfu_ops_per_launch;
     size_t mem_bytes_per_launch = mem_span * 16 * (size_t)mem_loops;
@@ -722,6 +780,11 @@ int main(int argc, char* argv[]) {
             LAUNCH_KERNEL_ASYNC(compute_fp16, blocks_fp16, block_size, 0, stream_fp16, fp16_loops, d_sink_fp16, inject_error);
             LAUNCH_KERNEL_ASYNC(compute_fp32, blocks_fp32, block_size, 0, stream_fp32, fp32_loops, d_sink_fp32, inject_error);
             LAUNCH_KERNEL_ASYNC(compute_sfu,  blocks_sfu,  block_size, 0, stream_sfu,  sfu_loops,  d_sink_sfu,  inject_error);
+#if PANTHEON_VENDOR_GEMM
+            if (use_gemm) {
+                for (int r = 0; r < gemm_loops; ++r) gemm.run(stream_mma);
+            }
+#endif
 #if OMNI_WMMA
             if (blocks_mma > 0) {
                 OMNI_LAUNCH_MMA(blocks_mma, block_size, stream_mma, mma_loops, d_sink_mma, inject_error, init_pattern);
@@ -750,6 +813,13 @@ int main(int argc, char* argv[]) {
         LAUNCH_KERNEL_ASYNC(compute_fp16, blocks_fp16, block_size, 0, stream_fp16, fp16_loops, d_sink_fp16, inject_error);
         LAUNCH_KERNEL_ASYNC(compute_fp32, blocks_fp32, block_size, 0, stream_fp32, fp32_loops, d_sink_fp32, inject_error);
         LAUNCH_KERNEL_ASYNC(compute_sfu,  blocks_sfu,  block_size, 0, stream_sfu,  sfu_loops,  d_sink_sfu,  inject_error);
+#if PANTHEON_VENDOR_GEMM
+        if (use_gemm) {
+            for (int r = 0; r < gemm_loops; ++r) {
+                if (!gemm.run(stream_mma)) { std::cerr << "[PANTHEON] Vendor GEMM matmul failed." << std::endl; return 1; }
+            }
+        }
+#endif
 #if OMNI_WMMA
         if (blocks_mma > 0) {
             OMNI_LAUNCH_MMA(blocks_mma, block_size, stream_mma, mma_loops, d_sink_mma, inject_error, init_pattern);
@@ -790,6 +860,15 @@ int main(int argc, char* argv[]) {
         // Verify SFU
         LAUNCH_KERNEL_ASYNC(verify_compute_stream, blocks_sfu, block_size, 0, stream_sfu, 3, d_sink_sfu, d_gold_sfu, sfu_threads, d_err_count);
 
+#if PANTHEON_VENDOR_GEMM
+        // Verify vendor GEMM: the last stress output against the reference.
+        if (d_gold_gemm) {
+            if (inject_error) LAUNCH_KERNEL_ASYNC(pantheon_gemm_flip_bit, 1, 1, 0, stream_mma, (unsigned int*)gemm.c);
+            int gemm_grid = (int)((gemm.out_words() + 255) / 256);
+            LAUNCH_KERNEL_ASYNC(verify_compute_stream, gemm_grid, 256, 0, stream_mma, 5,
+                                (float*)gemm.c, (float*)d_gold_gemm, gemm.out_words(), d_err_count);
+        }
+#endif
 
         // Verify Tensor
         if (d_gold_mma) {
@@ -803,6 +882,7 @@ int main(int argc, char* argv[]) {
 
         CHECK(hipFree(d_err_count));
         if (d_gold_mma) CHECK(hipFree(d_gold_mma));
+        if (d_gold_gemm) CHECK(hipFree(d_gold_gemm));
         CHECK(hipFree(d_gold_fp16));
         CHECK(hipFree(d_gold_fp32));
         CHECK(hipFree(d_gold_sfu));
@@ -818,6 +898,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+#if PANTHEON_VENDOR_GEMM
+    gemm.release();
+#endif
     CHECK(hipStreamDestroy(stream_mem));
     CHECK(hipStreamDestroy(stream_mma));
     CHECK(hipStreamDestroy(stream_fp16));

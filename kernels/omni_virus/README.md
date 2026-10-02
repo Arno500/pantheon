@@ -8,7 +8,7 @@
 
 | Area | Stress mechanism |
 | :--- | :--- |
-| Matrix cores | FP16 WMMA, `mma_acc` independent accumulators per warp, operands restaged from shared memory. |
+| Matrix cores | A vendor GEMM when the library loads, otherwise FP16 WMMA with `mma_acc` independent accumulators per warp and operands restaged from shared memory. |
 | Memory path | Coalesced non-temporal stores over a window that advances each launch, complementary patterns on adjacent words. |
 | FP16 path | Half2 quadratic map, eight independent chains per thread. |
 | FP32 path | FP32 quadratic map, eight independent chains per thread. |
@@ -65,7 +65,47 @@ done
 kill $smi
 ```
 
-`wmma::mma_sync` uses the synchronous MMA instructions and reached about 32% of peak on a B200 (720 of about 2250 dense FP16 TFLOPS). The asynchronous path (WGMMA on Hopper, the Blackwell tensor-core instructions) is not reachable through WMMA.
+`wmma::mma_sync` uses the synchronous MMA instructions and reached about 32% of peak on a B200 (720 of about 2250 dense FP16 TFLOPS). The asynchronous path (WGMMA on Hopper, the Blackwell tensor-core instructions) is not reachable through WMMA; the vendor GEMM below uses it.
+
+## Vendor GEMM
+
+When the vendor BLAS can be loaded, the tensor stream is a GEMM instead of WMMA: cuBLASLt on NVIDIA, hipBLASLt on AMD. The BLAS uses the part's asynchronous matrix instructions, which `wmma::mma_sync` cannot reach. The library is loaded with `dlopen`, so a missing library, a missing header at build time, or a format the part rejects prints the reason and keeps the WMMA stream.
+
+The GEMM fills the machine and cannot be limited to a block count, so it replaces the WMMA share. `mma_pct` then only decides how much of the grid the four other streams get, and `mma_acc`, `mma_groups` and `mma_reuse` do not apply. With `--verify` the first matmul is kept as the reference; `beta` is 0, so every later run must match it bit for bit.
+
+Measured on 8x B200, 45 s, all GPUs at once, steady-state power:
+
+| Tensor stream | Node W | W/GPU | Peak C | TFLOPS/GPU |
+| :--- | ---: | ---: | ---: | ---: |
+| `--gemm 0` (WMMA) | 5280 | 660 | 42 | 634 |
+| default (BF16 GEMM) | 6970 | 871 | 51 | 915 |
+
+### Formats and shape
+
+| `--gemm_type` | Operands | Output | Datapath |
+| :--- | :--- | :--- | :--- |
+| `auto` (default) | See below | | |
+| `bf16` | BF16 | BF16 | Tensor cores |
+| `fp16` | FP16 | FP16 | Tensor cores |
+| `tf32` | FP32 storage | FP32 | Tensor cores, TF32 math (NVIDIA only) |
+| `fp32` | FP32 | FP32 | Vector FMA pipes |
+| `fp8` | E4M3 | BF16 | Tensor cores, where the part has FP8 (NVIDIA only) |
+
+`--gemm_size N` sets a cube; `--gemm_m`, `--gemm_n` and `--gemm_k` set the shape separately (`C` is `m x n`, contracted over `k`). Dimensions are rounded down to a multiple of 16 and halved together if the operands would not fit in memory.
+
+On one B200, 15 s, default shape, with the other streams running: BF16 907 TFLOPS, FP16 842, TF32 481, FP8 1757, FP32 59. Power is within a few percent for the four tensor formats, so the format mostly changes TFLOPS.
+
+### Choosing the format
+
+`auto` gives the same format on every GPU. The formats are tried in a fixed order, BF16, FP16, TF32, FP8, FP32, and the first one the part and library accept is the default (BF16 needs Ampere or later, FP8 Ada or later). Each accepted format is also run alone for `--gemm_probe_ms` and its board power is read from NVML, matched by PCI bus ID. The default is replaced only by a format that draws at least `--gemm_margin` percent more. Without NVML, or with `--gemm_probe_ms 0`, the default is used.
+
+The margin is there because the probe is noisy. On a B200 one format varied by up to 9% between probes (TF32 959 to 1041 W, BF16 956 to 1022 W) while the gaps between tensor formats were 1 to 4%. Picking the maximum reading gave different formats on different GPUs of one node, and an 8% margin still did. With 15%, 8 of 8 GPUs chose BF16 in all 8 repeated rounds of `omni_virus` and `mma_virus`. Formats closer than the margin are not told apart; on a B200 only FP32 (about 25% lower) is separated. Use `--gemm_type` to choose a format. The probe runs without the other streams, so it ranks formats for the tensor path only.
+
+### AMD
+
+hipBLASLt is used when `hipblaslt/hipblaslt.h` and `hip/hip_bf16.h` are present. `fp8` and `tf32` are not offered: MI300 and later parts use different FP8 encodings, and the TF32 compute type is not in every ROCm release. `auto` cannot measure power, because only NVML is wired up, so it uses the default order (BF16, FP16, FP32).
+
+This backend was written against the current hipBLASLt API and checked only by compiling against a stub header. It has not run on AMD hardware, and older ROCm releases (`hipblasLtComputeType_t`) will not compile it.
 
 ## How It Works
 
@@ -96,6 +136,12 @@ build/omni_virus 0 60 90 --mma_pct 75 --launch_ms 400
 | `mma_acc` | `16` | Accumulator fragments per warp in the tensor stream: `2`, `4`, `8` or `16`. |
 | `mma_groups` | `4` | Operand reloads per iteration. |
 | `mma_reuse` | `1` | MMA passes per operand reload. |
+| `gemm` | `1` | Use the vendor GEMM when it can be loaded. `0` forces WMMA. |
+| `gemm_type` | `auto` | `auto`, `bf16`, `fp16`, `tf32`, `fp32` or `fp8`. |
+| `gemm_size` | `8192` | Sets `gemm_m`, `gemm_n` and `gemm_k` together. |
+| `gemm_m`, `gemm_n`, `gemm_k` | `8192` | GEMM shape, each rounded down to a multiple of 16. |
+| `gemm_probe_ms` | `1500` | Per-format power probe used by `auto`. `0` skips it. |
+| `gemm_margin` | `15` | Percent by which another format must beat the default for `auto` to switch. |
 | `launch_ms` | `200` | Per-launch wall-time target used to calibrate loop counts. `0` disables calibration and falls back to `kernel_loops`. |
 | `kernel_loops` | `5000` | Manual loop scale, used only when `launch_ms` is `0`. |
 | `warmup_iters` | `5` | Warmup launches before telemetry. |

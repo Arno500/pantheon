@@ -246,3 +246,46 @@ def test_shared_chaos_header_triggers_rebuilds():
               if line.startswith("COMMON_HEADERS")]
     assert common, "COMMON_HEADERS disappeared"
     assert "kernels/common/toggle_chaos.h" in common[0]
+
+
+def test_omni_virus_can_drive_the_tensor_cores_through_the_vendor_gemm():
+    """The vendor GEMM is loaded at run time and only ever an upgrade."""
+    header = Path("kernels/common/vendor_gemm.h").read_text()
+    omni = Path("kernels/omni_virus/omni_virus.cpp").read_text()
+    makefile = Path("Makefile").read_text()
+
+    # dlopen, not a link dependency: one link line serves every binary, and a
+    # hard -lcublasLt would keep unrelated tests from starting where the
+    # loader cannot find it.
+    assert "dlopen" in header
+    assert "-lcublasLt" not in makefile
+    assert "vendor_gemm.h" in makefile
+
+    # Absent library or API falls back to WMMA instead of failing the launch.
+    assert "using the portable WMMA tensor stream" in header
+    assert "PANTHEON_VENDOR_GEMM" in omni
+
+    # The GEMM stream is verified against its own first run.
+    assert "GEMM Stream Error" in omni
+
+    # Formats and shape are selectable, and the format is validated up front.
+    for flag in ("--gemm_type", "--gemm_size", "--gemm_m", "--gemm_n", "--gemm_k"):
+        assert flag in header
+    assert "Unknown --gemm_type" in header
+
+    # The default format is chosen by measurement, not hardcoded: BF16 is not
+    # available on every part.
+    assert 'std::string type = "auto"' in header
+    assert "pantheon_gemm_pick" in header
+
+
+def test_gemm_auto_format_keeps_the_default_unless_clearly_beaten():
+    """Probe noise on one part was larger than the gaps between formats, and
+    taking the maximum picked different formats on GPUs of the same node. The
+    default order plus a margin keeps the choice repeatable."""
+    header = Path("kernels/common/vendor_gemm.h").read_text(encoding="utf-8")
+    assert "margin_pct" in header
+    assert "--gemm_margin" in header
+    assert "GEMM_BF16, GEMM_FP16, GEMM_TF32, GEMM_FP8, GEMM_FP32" in header
+    margin = re.search(r"int margin_pct = (\d+);", header)
+    assert margin and int(margin.group(1)) >= 15, "margin below the measured probe noise"
